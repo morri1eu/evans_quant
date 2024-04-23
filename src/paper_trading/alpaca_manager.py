@@ -103,15 +103,6 @@ class AlpacaManager:
         if not self.is_market_open():
             print('market is closed')
             return
-        # try:
-        #     position = self.get_position_by_symbol(symbol)
-        #     return
-        # except Exception as e:
-        #     print('error getting position', e)
-
-        # if position is not None:
-        #     print('already have position in', symbol)
-        #     return
 
         [ticker, qty] = calculate_position_size(
             symbol, self.get_buying_power(), .02, 1)
@@ -144,44 +135,3 @@ class AlpacaManager:
         # Log the order
 
         return self.close_position_by_symbol(symbol)
-
-        # if float(position.unrealized_pl) > 0:
-        #     self.take_profit_manual(position)
-
-        # else:
-        #     self.stop_loss_manual(position)
-
-    # def buy_stock(self, symbol, qty):
-    #     # Implement the logic to buy a stock
-    #     pass
-
-    # def sell_stock(self, symbol, qty):
-    #     # Implement the logic to sell a stock
-    #     pass
-
-    # def get_portfolio(self):
-    #     # Implement the logic to get the current portfolio
-    #     pass
-
-    # def get_position_size(self, symbol, risk_factor):
-    #     # Implement the logic to calculate position size based on risk management
-    #     pass
-
-    # Add more methods as needed for portfolio management, position sizing, etc.
-
-
-# trading_client = TradingClient('api-key', 'secret-key')
-
-# # Get our account information.
-# account = trading_client.get_account()
-
-# # Check if our account is restricted from trading.
-# if account.trading_blocked:
-#     print('Account is currently restricted from trading.')
-
-# # Check how much money we can use to open new positions.
-# print('${} is available as buying power.'.format(account.buying_power))
-
-# Example usage:
-# manager = AlpacaManager()
-# manager.buy_stock('AAPL', 10)

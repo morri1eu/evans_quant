@@ -214,36 +214,6 @@ class AlpacaWebSocket:
 
 # Example usage
 stock_list = [
-    'COST',
-    'AAL',
-    'KHC',
-    'MAT',
-    'SIRI',
-    # 'WBA',
-    # 'NCLH',
-    'VOD',
-    'ADSK',
-    'TMUS',
-    # 'ATVI',
-    # 'AVGO',
-    # 'GILD',
-    # 'EBAY',
-    # 'EXPE',
-    # 'VRTX',
-    # 'BIDU',
-    # 'PYPL',
-    # 'MCHP',
-    # 'SWKS',
-    # 'JD',
-    # 'MU',
-    # 'NXPI',
-    # 'AMAT',
-    # 'WDC',
-    # 'CSX',
-    # 'TRIP',
-    # 'TSCO',
-    # 'FAST',
-    # 'LRCX'
 ]
 # alpaca_manager = AlpacaManager()  # Assuming this is already implemented
 
