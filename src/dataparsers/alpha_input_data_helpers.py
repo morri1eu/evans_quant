@@ -1,57 +1,70 @@
+import logging
 import pandas as pd
 
-def calculate_metrics(df):
-    # Calculate daily close-to-close returns
-    df['returns'] = df['close'].pct_change()
-    
-    # Calculate VWAP (Volume Weighted Average Price)
-    df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
-    
-    # Calculate market cap (Here, I'm assuming you have a 'shares_outstanding' column. If not, you'll need to fetch this data.)
-    # df['cap'] = df['close'] * df['shares_outstanding']
-    
-    # Calculate ADV (Average Daily Dollar Volume) for past d days. Here, I'm using d=20 as an example.
-    df['adv20'] = df['volume'] * df['vwap']
-    df['adv20'] = df['adv20'].rolling(window=20).mean()
-    
-    # Calculate ADV for other periods (e.g., d=50, d=100)
-    df['adv50'] = df['volume'] * df['vwap']
-    df['adv50'] = df['adv50'].rolling(window=50).mean()
-    
-    df['adv100'] = df['volume'] * df['vwap']
-    df['adv100'] = df['adv100'].rolling(window=100).mean()
-    
+logger = logging.getLogger(__name__)
+
+
+def _validate_numeric_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    missing = [col for col in columns if col not in df.columns]
+    if missing:
+        logger.error("Missing columns for metric calculation: %s", ", ".join(missing))
+        return pd.DataFrame()
     return df
 
-def calculate_signals(df):
-    # Calculate the 20-day and 100-day simple moving averages
+
+def calculate_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    df = _validate_numeric_columns(df, ["close", "high", "low", "volume"])
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df['returns'] = df['close'].pct_change()
+
+    df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
+
+    df['adv20'] = df['volume'] * df['vwap']
+    df['adv20'] = df['adv20'].rolling(window=20).mean()
+
+    df['adv50'] = df['volume'] * df['vwap']
+    df['adv50'] = df['adv50'].rolling(window=50).mean()
+
+    df['adv100'] = df['volume'] * df['vwap']
+    df['adv100'] = df['adv100'].rolling(window=100).mean()
+
+    return df
+
+
+def calculate_signals(df: pd.DataFrame) -> pd.DataFrame:
+    df = _validate_numeric_columns(df, ["close", "high", "low", "volume"])
+    if df.empty:
+        return df
+
+    df = df.copy()
     df['SMA20'] = df['close'].rolling(window=20).mean()
     df['SMA100'] = df['close'].rolling(window=100).mean()
-    
-    # Calculate the 20-day and 100-day exponential moving averages
+
     df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
     df['EMA100'] = df['close'].ewm(span=100, adjust=False).mean()
-    
-    # Calculate the MACD
+
     df['MACD'] = df['EMA20'] - df['EMA100']
-    
-    # Calculate the RSI
+
     delta = df['close'].diff()
-    up_days = delta.copy()
-    up_days[delta <= 0] = 0.0
-    down_days = abs(delta.copy())
-    down_days[delta > 0] = 0.0
+    up_days = delta.clip(lower=0)
+    down_days = (-delta).clip(lower=0)
     RS_up = up_days.rolling(window=14).mean()
     RS_down = down_days.rolling(window=14).mean()
     df['RSI'] = 100.0 - (100.0 / (1.0 + RS_up / RS_down))
-    
-    # Calculate the ATR
-    df['ATR'] = df['high'] - df['low']
-    df['ATR'] = df['ATR'].ewm(span=14, adjust=False).mean()
-    
-    # Calculate the Bollinger Bands
+
+    df['ATR'] = (df['high'] - df['low']).ewm(span=14, adjust=False).mean()
+
     df['BB_upper'] = df['SMA20'] + 2 * df['close'].rolling(window=20).std(ddof=0)
     df['BB_lower'] = df['SMA20'] - 2 * df['close'].rolling(window=20).std(ddof=0)
+
+    bull_trend = (df['EMA20'] > df['EMA100']) & (df['MACD'] > 0) & (df['RSI'] > 55)
+    bear_trend = (df['EMA20'] < df['EMA100']) & (df['MACD'] < 0) & (df['RSI'] < 45)
+    df['signal'] = 0
+    df.loc[bull_trend, 'signal'] = 1
+    df.loc[bear_trend, 'signal'] = -1
 
     return df
 
