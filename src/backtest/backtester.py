@@ -1,68 +1,146 @@
-# src/backtest/backtester.py
-import pandas as pd
+import logging
 import multiprocessing
-from src.dataparsers.alpha_input_data_helpers import calculate_metrics, calculate_signals
-from src.alphas.all_alphas import *
 import os
 import time
-from src.visualizations.generic_visualizations import plot_strategy, calculate_and_print_metrics, create_csv_from_metrics, calculate_mean_sharpe_ratio_from_metrics, create_df_from_metrics
+from typing import Callable, Tuple
 
-def backtest(data, initial_capital):
-    positions = pd.DataFrame(index=data.index).fillna(0.0)
-    positions['Stock'] = 100 * data['Signal']
-    portfolio = positions.multiply(data['Adj Close'], axis=0)
-    pos_diff = positions.diff()
-    portfolio['Holdings'] = (positions.multiply(data['Adj Close'], axis=0)).sum(axis=1)
-    portfolio['Cash'] = initial_capital - (pos_diff.multiply(data['Adj Close'], axis=0)).sum(axis=1).cumsum()
-    portfolio['Total'] = portfolio['Cash'] + portfolio['Holdings']
-    portfolio['Returns'] = portfolio['Total'].pct_change()
-    return portfolio
+import numpy as np
+import pandas as pd
 
-def get_data_for_backtest(stock_ticker, exchange):
-    try:
-        # read data from csv
-        path = f'../data/baseline_data/{exchange}/{stock_ticker}_baseline.csv'
-        data = pd.read_csv(path)
-        
-        # calculate metrics & indicators
-        data_with_metrics = calculate_metrics(data)
-        data_with_metrics_and_signals = calculate_signals(data_with_metrics)
+from src.alphas.all_alphas import *
+from src.backtest.config import BacktestConfig
+from src.dataparsers.alpha_input_data_helpers import calculate_metrics, calculate_signals
+from src.visualizations.generic_visualizations import (
+    calculate_and_print_metrics,
+    calculate_mean_sharpe_ratio_from_metrics,
+    create_csv_from_metrics,
+    create_df_from_metrics,
+    plot_strategy,
+)
 
-        # return data
-        return data_with_metrics_and_signals
-    except:
-        print(f'Error getting data for {stock_ticker}')
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+def _normalize_columns(data: pd.DataFrame) -> pd.DataFrame:
+    """Standardize column names so downstream functions can rely on snake_case."""
+
+    data = data.copy()
+    data.columns = [col.strip().lower().replace(" ", "_") for col in data.columns]
+    return data
+
+
+def _ensure_required_columns(data: pd.DataFrame, config: BacktestConfig) -> pd.DataFrame:
+    missing = [col for col in config.required_columns if col not in data.columns]
+    if missing:
+        logger.error("Missing required columns: %s", ", ".join(missing))
+        return pd.DataFrame()
+    return data
+
+
+def _pick_price_column(data: pd.DataFrame, config: BacktestConfig) -> str:
+    for candidate in config.price_column_candidates():
+        if candidate in data.columns:
+            return candidate
+    raise ValueError("No recognized price column found; looked for adj_close, close, price")
+
+
+def _compute_atr(data: pd.DataFrame, window: int) -> pd.Series:
+    true_range = pd.concat(
+        [
+            (data["high"] - data["low"]),
+            (data["high"] - data["close"].shift()).abs(),
+            (data["low"] - data["close"].shift()).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = true_range.rolling(window=window, min_periods=1).mean()
+    return atr
+
+
+def _calculate_position_sizes(data: pd.DataFrame, price_col: str, config: BacktestConfig) -> pd.Series:
+    atr = data.get("atr")
+    if atr is None:
+        atr = _compute_atr(data, config.atr_window)
+    atr = atr.clip(lower=1e-4).fillna(method="ffill")
+
+    per_trade_risk = config.initial_capital * config.risk_per_trade
+    raw_sizes = (per_trade_risk / (atr * config.atr_multiplier)).clip(lower=0)
+
+    max_position_value = config.initial_capital * config.max_position_value_pct
+    value_limited_sizes = (max_position_value / data[price_col]).clip(lower=0)
+
+    sizes = np.floor(np.minimum(raw_sizes, value_limited_sizes)).astype(int)
+    return sizes
+
+
+def backtest(data: pd.DataFrame, config: BacktestConfig | None = None) -> pd.DataFrame:
+    config = config or BacktestConfig()
+    data = _normalize_columns(data)
+    data = _ensure_required_columns(data, config)
+    if data.empty:
         return pd.DataFrame()
 
-# def run_backtest(exchange='NASDAQ'):
-#     # get list of stocks for exchange
-#     stocks = get_stocks_for_exchange(exchange)
+    data_with_metrics = calculate_metrics(data)
+    data_with_metrics_and_signals = calculate_signals(data_with_metrics)
 
-#     portfolios = []
-#     stocks.sort()
-#     metrics = []
-#     # stocks_to_use = stocks[:100]
-#     # loop through stocks
-#     for stock_ticker in stocks:
-#         # get data for backtest
-#         data = get_data_for_backtest(stock_ticker, exchange)
-#         # make sure data is not empty
-        
-#         if data.empty:
-#             continue
-#         # perform backtest
-#         stock_portfolio = alpha_2_strategy(data, .25, -.25)
-#         portfolios.append([stock_portfolio, stock_ticker])
-#         # plot_strategy(data, stock_portfolio)
-#         metrics.append(calculate_and_print_metrics(stock_portfolio, stock_ticker, False))
-        
-#     # return portfolios
-#     create_csv_from_metrics(metrics, exchange, alpha_name='alpha_2')
-#     return portfolios
+    if "signal" not in data_with_metrics_and_signals.columns:
+        logger.error("Cannot run backtest without a 'signal' column in the dataset.")
+        return pd.DataFrame()
 
-def backtest_stock(stock_ticker, exchange, alpha_function_long, alpha_function_short, upper_bound, lower_bound):
-    print('backtest stock', stock_ticker)
-    data = get_data_for_backtest(stock_ticker, exchange)
+    price_col = _pick_price_column(data_with_metrics_and_signals, config)
+    position_sizes = _calculate_position_sizes(data_with_metrics_and_signals, price_col, config)
+
+    positions = pd.DataFrame(index=data_with_metrics_and_signals.index).fillna(0.0)
+    positions["stock_shares"] = position_sizes * data_with_metrics_and_signals["signal"]
+
+    portfolio = positions.multiply(data_with_metrics_and_signals[price_col], axis=0)
+    pos_diff = positions.diff()
+
+    trade_costs = (pos_diff.abs() * config.transaction_cost_per_share).multiply(
+        data_with_metrics_and_signals[price_col], axis=0
+    )
+
+    portfolio["Holdings"] = (positions.multiply(data_with_metrics_and_signals[price_col], axis=0)).sum(axis=1)
+    portfolio["Cash"] = config.initial_capital - (
+        (pos_diff.multiply(data_with_metrics_and_signals[price_col], axis=0)).sum(axis=1).cumsum()
+        + trade_costs.sum(axis=1).cumsum()
+    )
+    portfolio["Total"] = portfolio["Cash"] + portfolio["Holdings"]
+    portfolio["Returns"] = portfolio["Total"].pct_change()
+    portfolio["Drawdown"] = portfolio["Total"] / portfolio["Total"].cummax() - 1
+    return portfolio
+
+
+def get_data_for_backtest(stock_ticker: str, exchange: str, config: BacktestConfig | None = None) -> pd.DataFrame:
+    config = config or BacktestConfig()
+    try:
+        path = f"../data/baseline_data/{exchange}/{stock_ticker}_baseline.csv"
+        data = pd.read_csv(path)
+        data = _normalize_columns(data)
+        data = _ensure_required_columns(data, config)
+        if data.empty:
+            return pd.DataFrame()
+
+        data_with_metrics = calculate_metrics(data)
+        data_with_metrics_and_signals = calculate_signals(data_with_metrics)
+        return data_with_metrics_and_signals
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error getting data for %s: %s", stock_ticker, exc)
+        return pd.DataFrame()
+
+
+def backtest_stock(
+    stock_ticker: str,
+    exchange: str,
+    alpha_function_long: Callable,
+    alpha_function_short: Callable,
+    upper_bound: float,
+    lower_bound: float,
+    config: BacktestConfig | None = None,
+):
+    logger.info("Backtesting %s", stock_ticker)
+    data = get_data_for_backtest(stock_ticker, exchange, config)
     if data.empty:
         return None
     stock_portfolio_long = alpha_function_long(data, upper_bound)
@@ -71,55 +149,77 @@ def backtest_stock(stock_ticker, exchange, alpha_function_long, alpha_function_s
     metrics_short = calculate_and_print_metrics(stock_portfolio_short, stock_ticker, False, data)
     return stock_portfolio_long, stock_portfolio_short, metrics_long, metrics_short
 
-def run_backtest_for_all_exchanges(alpha_name, alpha_function):
-    exchanges = [name for name in os.listdir('../data/baseline_data') if os.path.isdir(os.path.join('../data/baseline_data', name))]
+
+def run_backtest_for_all_exchanges(alpha_name: str, alpha_function: Callable):
+    exchanges = [
+        name
+        for name in os.listdir("../data/baseline_data")
+        if os.path.isdir(os.path.join("../data/baseline_data", name))
+    ]
     try:
         for exchange in exchanges:
             run_backtest(alpha_name, alpha_function, exchange)
-    except Exception as e:
-        print(f'Error running backtest for {exchange}: {e}')
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error running backtest for %s: %s", exchange, exc)
 
-def run_backtest(alpha_function_long, alpha_function_short, upper_bound, lower_bound, exchange):
+
+def run_backtest(
+    alpha_function_long: Callable,
+    alpha_function_short: Callable,
+    upper_bound: float,
+    lower_bound: float,
+    exchange: str,
+    config: BacktestConfig | None = None,
+):
+    config = config or BacktestConfig()
     stocks = get_stocks_for_exchange(exchange)
     stocks.sort()
 
-    # Use all available CPUs or define the number you want to use
     num_processes = multiprocessing.cpu_count()
-    print(f'Using {num_processes} processes')
-    # Create a multiprocessing Pool
-    with multiprocessing.Pool(num_processes) as pool:
-        # Map backtest_stock function to all stocks
-        results = pool.starmap(backtest_stock, [(stock, exchange, alpha_function_long, alpha_function_short, upper_bound, lower_bound) for stock in stocks])
+    logger.info("Using %s processes", num_processes)
 
-    # Filter out None results if any stock data was empty
+    with multiprocessing.Pool(num_processes) as pool:
+        results = pool.starmap(
+            backtest_stock,
+            [
+                (stock, exchange, alpha_function_long, alpha_function_short, upper_bound, lower_bound, config)
+                for stock in stocks
+            ],
+        )
+
     results = [result for result in results if result is not None]
-    
-    # Separate the portfolios and metrics
+
+    if not results:
+        return [], [], [], []
+
     portfolios_long, portfolios_short, metrics_long, metrics_short = zip(*results)
-    
-    # Create CSV from metrics
-    # create_csv_from_metrics(all_metrics, exchange, alpha_name)
 
     return portfolios_long, portfolios_short, metrics_long, metrics_short
 
-def save_backtest_results(portfolios, exchange):
-    # save results to csv
-    for portfolio in portfolios:
-        portfolio[0].to_csv(f'../data/backtest_results/{exchange}/{portfolio[1]}_backtest.csv')
-    
 
-def get_stocks_for_exchange(exchange='NASDAQ'):
-    # get list of stocks for exchange
-    stocks = os.listdir(f'../data/baseline_data/{exchange}')
-    
-    # extract tickers from filenames
+def save_backtest_results(portfolios: list[Tuple[pd.DataFrame, str]], exchange: str):
+    for portfolio in portfolios:
+        portfolio[0].to_csv(f"../data/backtest_results/{exchange}/{portfolio[1]}_backtest.csv")
+
+
+def get_stocks_for_exchange(exchange: str = "NASDAQ"):
+    stocks = os.listdir(f"../data/baseline_data/{exchange}")
     stock_tickers = [extract_ticker_from_filename(stock) for stock in stocks]
     return stock_tickers
 
-def extract_ticker_from_filename(filename):
-    return filename.split('_')[0]
 
-def optimize_alpha_for_bounds_by_exchange(alpha_name, alpha_function_long, alpha_function_short, range, step_size, exchange):
+def extract_ticker_from_filename(filename: str):
+    return filename.split("_")[0]
+
+
+def optimize_alpha_for_bounds_by_exchange(
+    alpha_name: str,
+    alpha_function_long: Callable,
+    alpha_function_short: Callable,
+    range: tuple,
+    step_size: float,
+    exchange: str,
+):
     best_metric_upper = -np.inf
     best_metric_lower = -np.inf
     best_upper_bound = None
@@ -127,49 +227,85 @@ def optimize_alpha_for_bounds_by_exchange(alpha_name, alpha_function_long, alpha
     df_of_metrics_for_best_upper_bound = None
     df_of_metrics_for_best_lower_bound = None
 
-    # Iterate over all possible combinations of upper and lower bounds
     for boundary in np.arange(range[0], range[1], step_size):
-        # Ensure the upper bound is greater than the lower bound
         start = time.time()
+        logger.info(
+            "Running backtest for %s with upper bound %s and lower bound %s on %s",
+            alpha_name,
+            boundary,
+            -boundary,
+            exchange,
+        )
+        [portfolios_long, portfolios_short, metrics_long, metrics_short] = run_backtest(
+            alpha_function_long, alpha_function_short, boundary, -boundary, exchange
+        )
 
-        print(f'Running backtest for {alpha_name} with upper bound {boundary} and lower bound {-boundary} on {exchange}')
-        # Backtest the strategy with the current set of bounds
-        [portfolios_long, portfolios_short, metrics_long, metrics_short] = run_backtest(alpha_function_long, alpha_function_short, boundary, -boundary, exchange)
+        if not metrics_long or not metrics_short:
+            logger.warning("No metrics returned for %s at bound %s", exchange, boundary)
+            continue
 
-        # Evaluate the strategy's performance
         mean_sharpe_ratio_for_upper_bounds = calculate_mean_sharpe_ratio_from_metrics(metrics_long, boundary)
         mean_sharpe_ratio_for_lower_bounds = calculate_mean_sharpe_ratio_from_metrics(metrics_short, -boundary)
 
-        # If the performance is better than what we've seen, store the bounds
         if mean_sharpe_ratio_for_upper_bounds > best_metric_upper:
-            print('new best upper bound', boundary)
+            logger.info("New best upper bound %s", boundary)
             best_metric_upper = mean_sharpe_ratio_for_upper_bounds
             best_upper_bound = boundary
             df_of_metrics_for_best_upper_bound = create_df_from_metrics(metrics_long, boundary)
-        
-        # If the performance is better than what we've seen, store the bounds
+
         if mean_sharpe_ratio_for_lower_bounds > best_metric_lower:
-            print('new best lower bound', -boundary)
+            logger.info("New best lower bound %s", -boundary)
             best_metric_lower = mean_sharpe_ratio_for_lower_bounds
             best_lower_bound = -boundary
             df_of_metrics_for_best_lower_bound = create_df_from_metrics(metrics_short, -boundary)
         end = time.time()
-        print(end - start)
+        logger.info("Completed bound sweep step in %.2fs", end - start)
 
-    if not os.path.exists(f'../data/backtest_results/{exchange}/{alpha_name}'):
-        os.makedirs(f'../data/backtest_results/{exchange}/{alpha_name}')
-    
-    df_of_metrics_for_best_upper_bound.to_csv(f'../data/backtest_results/{exchange}/{alpha_name}/long_metrics.csv')
-    df_of_metrics_for_best_lower_bound.to_csv(f'../data/backtest_results/{exchange}/{alpha_name}/short_metrics.csv')
+    os.makedirs(f"../data/backtest_results/{exchange}/{alpha_name}", exist_ok=True)
 
-    print(f'Best upper bound for {alpha_name} on {exchange}: {best_upper_bound}, sharpe ratio: {best_metric_upper}')
-    print(f'Best lower bound for {alpha_name} on {exchange}: {best_lower_bound}, sharpe ratio: {best_metric_lower}')
+    if df_of_metrics_for_best_upper_bound is not None:
+        df_of_metrics_for_best_upper_bound.to_csv(
+            f"../data/backtest_results/{exchange}/{alpha_name}/long_metrics.csv"
+        )
+    if df_of_metrics_for_best_lower_bound is not None:
+        df_of_metrics_for_best_lower_bound.to_csv(
+            f"../data/backtest_results/{exchange}/{alpha_name}/short_metrics.csv"
+        )
+
+    logger.info(
+        "Best upper bound for %s on %s: %s, sharpe ratio: %s",
+        alpha_name,
+        exchange,
+        best_upper_bound,
+        best_metric_upper,
+    )
+    logger.info(
+        "Best lower bound for %s on %s: %s, sharpe ratio: %s",
+        alpha_name,
+        exchange,
+        best_lower_bound,
+        best_metric_lower,
+    )
     return best_upper_bound, best_metric_upper, best_lower_bound, best_metric_lower
 
-def optimize_alpha_for_bounds_all_exchanges(alpha_name, alpha_function_long, alpha_function_short, range, step_size, exchange):
-    exchanges = [name for name in os.listdir('../data/baseline_data') if os.path.isdir(os.path.join('../data/baseline_data', name))]
+
+def optimize_alpha_for_bounds_all_exchanges(
+    alpha_name: str,
+    alpha_function_long: Callable,
+    alpha_function_short: Callable,
+    range: tuple,
+    step_size: float,
+    exchange: str,
+):
+    exchanges = [
+        name
+        for name in os.listdir("../data/baseline_data")
+        if os.path.isdir(os.path.join("../data/baseline_data", name))
+    ]
     try:
         for exchange in exchanges:
-            optimize_alpha_for_bounds_by_exchange(alpha_name, alpha_function_long, alpha_function_short, range, step_size, exchange)
-    except Exception as e:
-        print(f'Error running backtest for {exchange}: {e}')
+            optimize_alpha_for_bounds_by_exchange(
+                alpha_name, alpha_function_long, alpha_function_short, range, step_size, exchange
+            )
+    except Exception as exc:  # pragma: no cover - defensive logging
+        logger.exception("Error running backtest for %s: %s", exchange, exc)

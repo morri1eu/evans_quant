@@ -147,37 +147,28 @@ def plot_data_with_indicators_interval(data, stock_ticker):
 
 
 def calculate_and_print_metrics(portfolio, stock_ticker, should_print, data):
-    # Sharpe Ratio
-    sharpe_ratio = np.sqrt(
-        252) * (portfolio['Returns'].mean() / portfolio['Returns'].std())
+    returns = portfolio['Returns'].dropna()
+    volatility = returns.std()
+    sharpe_ratio = np.sqrt(252) * returns.mean() / volatility if volatility != 0 else np.nan
 
-    # Maximum Drawdown
     portfolio['Peak'] = portfolio['Total'].cummax()
-    portfolio['Drawdown'] = (portfolio['Total'] -
-                             portfolio['Peak']) / portfolio['Peak']
+    portfolio['Drawdown'] = (portfolio['Total'] - portfolio['Peak']) / portfolio['Peak']
     max_drawdown = portfolio['Drawdown'].min()
 
-    # Maximum Drawdown Duration
     drawdown_duration = (portfolio['Drawdown'] == 0).astype(int)
     drawdown_duration = drawdown_duration.groupby(
         (drawdown_duration != drawdown_duration.shift()).cumsum()).cumsum()
     max_drawdown_duration = drawdown_duration.max()
 
-    # Annualized Return
-    annualized_return = (portfolio['Returns'].mean() + 1) ** 252 - 1
+    annualized_return = (1 + returns.mean()) ** 252 - 1 if not returns.empty else np.nan
+    total_return = portfolio['Total'].iloc[-1] / portfolio['Total'].iloc[0] - 1 if len(portfolio['Total']) else np.nan
 
-    # Total Return
-    total_return = portfolio['Total'].iloc[-1] / portfolio['Total'].iloc[0] - 1
-
-    # Average True Range
     average_true_range = calculate_atr(data)
 
-    # RSI (Relative Strength Index)
     rsi_21 = calculate_rsi(data, 21)
     rsi_14 = calculate_rsi(data)
     rsi_7 = calculate_rsi(data, 7)
 
-    # SMA (Simple Moving Average)
     sma_20 = data['close'].rolling(window=20).mean()
     sma_50 = data['close'].rolling(window=50).mean()
     sma_200 = data['close'].rolling(window=200).mean()
